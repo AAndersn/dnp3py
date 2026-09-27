@@ -669,11 +669,11 @@ class TestRequestVariants:
 
 
 class TestScheduledPolls:
-    """`poll()` and the `run_polls()` drive loop.
+    """`poll()` runs one scheduler task.
 
     Scheduling itself is `PollScheduler`'s job and is tested in
-    `test_polling.py`; what matters here is that the runner drives it and marks
-    tasks executed, so a due task does not fire forever.
+    `test_polling.py`; what matters here is that the runner marks tasks
+    executed, so a due task does not fire forever.
     """
 
     async def test_poll_marks_task_executed(self) -> None:
@@ -723,40 +723,6 @@ class TestScheduledPolls:
         await responder
 
         assert sent[0][0] & 0x0F == (first + 1) % 16
-
-    async def test_run_polls_returns_when_nothing_scheduled(self) -> None:
-        """With an empty scheduler the loop returns instead of spinning."""
-        channel_a, _ = create_channel_pair()
-        await channel_a.open()
-        runner, _ = make_runner(channel_a)
-        await runner.open()
-        runner.master.scheduler.clear()
-
-        await asyncio.wait_for(runner.run_polls(), timeout=1.0)
-
-    async def test_run_polls_stops_on_event(self) -> None:
-        """Setting the stop event ends the loop after the current poll."""
-        channel_a, channel_b = create_channel_pair()
-        await channel_a.open()
-        await channel_b.open()
-        runner, _ = make_runner(channel_a)
-        await runner.open()
-        peer = FakeOutstation(channel_b)
-        runner.master.scheduler.clear()
-        runner.master.scheduler.add_task(IntegrityPollTask())
-
-        stop = asyncio.Event()
-
-        async def respond() -> None:
-            await peer.read_fragments(1)
-            await peer.send_fragment(analog_response(seq=0, fir=True, fin=True, con=False, index=0, value=1.0))
-            stop.set()
-
-        responder = asyncio.create_task(respond())
-        await asyncio.wait_for(runner.run_polls(stop=stop), timeout=2.0)
-        await responder
-
-        assert stop.is_set()
 
 
 class TestMalformedTraffic:
@@ -912,30 +878,6 @@ class TestReceiveEdgeCases:
         with pytest.raises(ResponseTimeoutError):
             await runner.integrity_poll()
         await closer
-
-    async def test_run_polls_waits_for_a_future_task(self) -> None:
-        """A task not yet due makes the loop wait rather than busy-spin."""
-        channel_a, _ = create_channel_pair()
-        await channel_a.open()
-        runner, _ = make_runner(channel_a)
-        await runner.open()
-        runner.master.scheduler.clear()
-
-        # An interval task with last_poll_time set to now is not due for an
-        # hour, so the loop must sleep on the stop event.
-        task = IntegrityPollTask(interval=3600.0)
-        task.mark_executed()
-        runner.master.scheduler.add_task(task)
-
-        stop = asyncio.Event()
-
-        async def stop_soon() -> None:
-            await asyncio.sleep(0.1)
-            stop.set()
-
-        stopper = asyncio.create_task(stop_soon())
-        await asyncio.wait_for(runner.run_polls(stop=stop), timeout=2.0)
-        await stopper
 
 
 class TestRequestCorrelation:
@@ -1199,46 +1141,7 @@ class TestBurstBounds:
 
 
 class TestErrorContainment:
-    """`run_polls()` must survive the failures a real link produces."""
-
-    async def test_run_polls_survives_a_timeout(self) -> None:
-        """A dropped packet does not end the polling loop.
-
-        One `ResponseTimeoutError` is the normal outcome of a single lost frame.
-        Ending the loop on it turns a transient blip into permanent silence with
-        `is_open` still reporting `True`.
-        """
-        channel_a, channel_b = create_channel_pair()
-        await channel_a.open()
-        await channel_b.open()
-        runner, handler = make_runner(channel_a, response_timeout=0.2)
-        await runner.open()
-        peer = FakeOutstation(channel_b)
-        runner.master.scheduler.add_task(IntegrityPollTask())
-
-        stop = asyncio.Event()
-
-        async def ignore_then_answer() -> None:
-            # First poll: read it and stay silent, forcing a timeout.
-            await peer.read_request_seq()
-            # Second poll: answer properly. Reaching here at all proves the loop
-            # survived the first failure.
-            seq = await peer.read_request_seq(timeout=5.0)
-            await peer.send_fragment(analog_response(seq=seq, fir=True, fin=True, con=False, index=2, value=55.0))
-            stop.set()
-
-        peer_task = asyncio.create_task(ignore_then_answer())
-        poll_task = asyncio.create_task(runner.run_polls(stop=stop))
-        try:
-            await asyncio.wait_for(peer_task, timeout=10.0)
-            await asyncio.wait_for(poll_task, timeout=10.0)
-        finally:
-            stop.set()
-            poll_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await poll_task
-
-        assert handler.analog_inputs.get(2) == 55.0, "the loop must keep polling after a timeout"
+    """Failures a real link produces surface under `MasterRunnerError`."""
 
     async def test_reassembly_error_is_wrapped_as_link_error(self) -> None:
         """An out-of-order transport segment surfaces under `MasterRunnerError`.

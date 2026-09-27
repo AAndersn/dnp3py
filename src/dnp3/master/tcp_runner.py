@@ -14,9 +14,8 @@ multi-fragment application CONFIRM handshake.
 
 Scheduling deliberately lives *above* this class. `PollScheduler` models when a
 poll is due and is transport-independent; driving it from inside a TCP runner
-would make a serial or UDP implementation reimplement the loop. `run_polls()` is
-offered as a convenience that composes the two, and is the only method that
-knows about time.
+would make a serial or UDP implementation reimplement the loop. `poll(task)`
+runs one scheduled task; the loop that decides when to call it is the caller's.
 
 This is not a mirror of `OutstationTcpRunner`. The two share a shape at the link
 and transport layers, but the seam between them is better extracted once there
@@ -26,7 +25,6 @@ are two real implementations to compare than guessed from one.
 from __future__ import annotations
 
 import asyncio
-import contextlib
 import logging
 from collections import deque
 from dataclasses import dataclass, field
@@ -406,47 +404,6 @@ class MasterTcpRunner:
             return info
 
     # -- scheduling -----------------------------------------------------------
-
-    async def run_polls(self, *, stop: asyncio.Event | None = None) -> None:
-        """Drive the master's `PollScheduler` until stopped.
-
-        Composes scheduling with transport rather than owning either: the
-        intervals come from `PollingConfig`, the due-time arithmetic from
-        `PollScheduler`, and only the sending happens here. Any other transport
-        can reuse the same scheduler the same way.
-
-        A failed poll does not end the loop. One dropped packet on a SCADA link
-        is a `ResponseTimeoutError`, and a link that drops is a `LinkError`;
-        treating either as fatal would turn a transient blip into permanent
-        silence, with `is_open` still reporting `True` and the only trace a
-        "Task exception was never retrieved" at shutdown. Failures are logged
-        and the loop continues to the next due task. Cancellation and
-        programming errors still propagate.
-
-        Callers that need to react to failures rather than read logs should
-        drive `poll()` directly; this method is the unsupervised convenience.
-
-        Args:
-            stop: Event that ends the loop when set. Without one the loop runs
-                until cancelled.
-        """
-        self._require_open()
-        stop = stop if stop is not None else asyncio.Event()
-
-        while not stop.is_set():
-            task = self.master.scheduler.get_next_task()
-            if task is not None:
-                try:
-                    await self.poll(task)
-                except MasterRunnerError:
-                    logger.exception("Scheduled poll failed; continuing")
-                continue
-
-            wait = self.master.scheduler.get_time_until_next()
-            if wait is None:
-                return
-            with contextlib.suppress(TimeoutError):
-                await asyncio.wait_for(stop.wait(), timeout=max(wait, 0.0))
 
     async def poll(self, task: PollTask) -> list[ResponseInfo]:
         """Run one scheduled poll task and mark it executed.
