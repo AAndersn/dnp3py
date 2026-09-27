@@ -150,8 +150,12 @@ class MasterTcpRunner:
 
     @property
     def is_open(self) -> bool:
-        """Whether the underlying channel is open."""
-        return self.channel is not None and self.channel.is_open
+        """Whether the runner is open and its channel still is.
+
+        False once the peer has closed the connection, even when an injected
+        channel still reports itself open.
+        """
+        return self._reassembler is not None and self.channel is not None and self.channel.is_open
 
     @property
     def local_address(self) -> tuple[str, int] | None:
@@ -555,8 +559,9 @@ class MasterTcpRunner:
             or belonged to an earlier request.
 
         Raises:
-            ResponseTimeoutError: The deadline passed, or the peer closed.
-            LinkError: The link failed or delivered unusable bytes.
+            ResponseTimeoutError: The deadline passed.
+            LinkError: The link failed, the peer closed the connection, or it
+                delivered unusable bytes.
             MasterRunnerError: A fragment broke the burst's sequence walk.
         """
         data = await self._read_fragment_bytes(deadline)
@@ -589,9 +594,9 @@ class MasterTcpRunner:
             The reassembled application fragment.
 
         Raises:
-            ResponseTimeoutError: The deadline passed, or the peer closed.
-            LinkError: The link failed, or a transport segment did not fit the
-                stream being reassembled.
+            ResponseTimeoutError: The deadline passed.
+            LinkError: The link failed, the peer closed the connection, or a
+                transport segment did not fit the stream being reassembled.
         """
         channel, reassembler = self._require_open()
         loop = asyncio.get_running_loop()
@@ -624,8 +629,11 @@ class MasterTcpRunner:
                 raise LinkError(msg) from exc
 
             if not data:
-                msg = "Peer closed the connection while awaiting a response"
-                raise ResponseTimeoutError(msg)
+                # EOF: nothing more will ever arrive. Closing the runner makes
+                # is_open report it and stops every later call early.
+                await self.close()
+                msg = "Peer closed the connection"
+                raise LinkError(msg)
 
             # Drain the parser in full before handling any frame. `feed()`
             # materializes every complete frame from the chunk, so consuming

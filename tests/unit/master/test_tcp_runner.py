@@ -821,8 +821,8 @@ class TestMalformedTraffic:
         assert 8 not in handler.analog_inputs
         assert handler.analog_inputs[1] == pytest.approx(5.0)
 
-    async def test_peer_close_raises_timeout_error(self) -> None:
-        """A peer that closes mid-exchange raises rather than hanging."""
+    async def test_peer_close_raises_link_error(self) -> None:
+        """A peer that closes mid-exchange raises LinkError and closes the runner."""
         channel_a, channel_b = create_channel_pair()
         await channel_a.open()
         await channel_b.open()
@@ -835,9 +835,10 @@ class TestMalformedTraffic:
             await channel_b.close()
 
         closer = asyncio.create_task(close_after_request())
-        with pytest.raises(ResponseTimeoutError):
+        with pytest.raises(LinkError, match="closed"):
             await runner.integrity_poll()
         await closer
+        assert runner.is_open is False
 
 
 class TestChannelOwnership:
@@ -1302,6 +1303,52 @@ class TestLinkFailure:
 
         with pytest.raises(LinkError, match="Link failed"):
             await runner.integrity_poll()
+
+
+class TestPeerEof:
+    """A peer that closes the connection is a dead link, not a quiet one."""
+
+    class EofChannel:
+        """Channel whose reads report EOF, as a socket does once the peer closes."""
+
+        is_open = True
+
+        def __init__(self) -> None:
+            self.reads = 0
+
+        async def write_all(self, data: bytes) -> None:
+            return None
+
+        async def read(self, size: int) -> bytes:
+            self.reads += 1
+            return b""
+
+        async def close(self) -> None:
+            self.is_open = False
+
+    async def test_listen_raises_link_error_on_eof(self) -> None:
+        """`listen_unsolicited` raises promptly instead of returning None forever."""
+        channel = self.EofChannel()
+        runner, _ = make_runner(channel, response_timeout=5.0)
+        await runner.open()
+
+        with pytest.raises(LinkError, match="closed"):
+            await asyncio.wait_for(runner.listen_unsolicited(timeout=5.0), timeout=1.0)
+
+        assert runner.is_open is False
+        assert channel.reads == 1
+        with pytest.raises(MasterRunnerError):
+            await runner.listen_unsolicited(timeout=0.1)
+
+    async def test_request_raises_link_error_on_eof(self) -> None:
+        """A poll whose read hits EOF raises LinkError, not ResponseTimeoutError."""
+        runner, _ = make_runner(self.EofChannel(), response_timeout=5.0)
+        await runner.open()
+
+        with pytest.raises(LinkError, match="closed"):
+            await asyncio.wait_for(runner.integrity_poll(), timeout=1.0)
+
+        assert runner.is_open is False
 
 
 class TestPostCloseLifecycle:
