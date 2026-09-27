@@ -102,6 +102,14 @@ class SimulatorChannel:
             except asyncio.QueueEmpty:
                 break
 
+        # Wake a read() already parked on this channel's own queue. A real
+        # socket close interrupts its own pending read too; without this the
+        # outcome for a read in flight depends on whether asyncio scheduled
+        # read()'s body before or after this close(), which differs by
+        # Python version.
+        with contextlib.suppress(asyncio.QueueFull):
+            self._read_queue.put_nowait(b"")
+
         self._state = ChannelState.CLOSED
 
     async def read(self, max_bytes: int) -> bytes:
@@ -132,6 +140,12 @@ class SimulatorChannel:
             data = await asyncio.wait_for(self._read_queue.get(), timeout=timeout)
         except TimeoutError as e:
             raise ChannelTimeoutError("Read timed out") from e
+
+        # This channel (not the peer) may have closed while the get() above
+        # was parked; that wakes it with the same b"" sentinel a genuine
+        # peer EOF uses, so the state is what tells the two apart.
+        if self._state != ChannelState.OPEN:
+            raise ChannelClosedError("Channel is not open")
 
         if not data:  # EOF
             return b""

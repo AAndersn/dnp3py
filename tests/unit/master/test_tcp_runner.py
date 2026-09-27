@@ -897,8 +897,13 @@ class TestReceiveEdgeCases:
         with pytest.raises(MasterRunnerError, match="closed"):
             await runner.integrity_poll()
 
-    async def test_read_side_close_times_out(self) -> None:
-        """A channel closed after the request is sent surfaces as a timeout."""
+    async def test_read_side_close_raises_link_error(self) -> None:
+        """A channel closed after the request is sent is a link failure.
+
+        Per `_read_fragment_bytes`'s own contract, `ResponseTimeoutError` is
+        for a deadline passing; a channel known to be closed is a link
+        failure, the same as the peer-EOF case in `TestPeerEof`.
+        """
         channel_a, channel_b = create_channel_pair()
         await channel_a.open()
         await channel_b.open()
@@ -911,7 +916,7 @@ class TestReceiveEdgeCases:
             await channel_a.close()
 
         closer = asyncio.create_task(close_master_side())
-        with pytest.raises(ResponseTimeoutError):
+        with pytest.raises(LinkError, match="not open"):
             await runner.integrity_poll()
         await closer
 
