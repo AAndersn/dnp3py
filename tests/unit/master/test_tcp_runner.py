@@ -481,6 +481,32 @@ class TestUnsolicited:
 
         confirms = await peer.read_fragments(1)
         assert confirms[0][1] == FunctionCode.CONFIRM.value
+        # IEEE 1815-2012 4.2.2.4 Rule 18: same SEQ and UNS as the confirmed fragment.
+        assert confirms[0][0] & 0x10, "UNS must be set on an unsolicited CONFIRM"
+        assert confirms[0][0] & 0x0F == 2
+        assert confirms[0][0] & 0x20 == 0, "a CONFIRM never requests confirmation"
+
+    async def test_listen_does_not_confirm_when_con_clear(self) -> None:
+        """An unsolicited response with CON clear is reported but not confirmed."""
+        channel_a, channel_b = create_channel_pair()
+        await channel_a.open()
+        await channel_b.open()
+        runner, handler = make_runner(channel_a)
+        await runner.open()
+        peer = FakeOutstation(channel_b)
+
+        unsolicited = bytearray(analog_response(seq=4, fir=True, fin=True, con=False, index=9, value=43.0))
+        unsolicited[0] |= 0x10  # UNS bit
+        unsolicited[1] = FunctionCode.UNSOLICITED_RESPONSE.value
+
+        await peer.send_fragment(bytes(unsolicited))
+        info = await runner.listen_unsolicited(timeout=2.0)
+
+        assert info is not None
+        assert info.is_unsolicited is True
+        assert handler.analog_inputs[9] == pytest.approx(43.0)
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(channel_b.read(4096), timeout=0.2)
 
     async def test_listen_returns_none_on_timeout(self) -> None:
         """No unsolicited traffic yields None rather than raising."""
@@ -510,13 +536,15 @@ class TestUnsolicited:
         unsolicited[0] |= 0x10
         unsolicited[1] = FunctionCode.UNSOLICITED_RESPONSE.value
 
+        confirms: list[bytes] = []
+
         async def respond() -> None:
             await peer.read_fragments(1)
             await peer.send_fragment(analog_response(seq=0, fir=True, fin=False, con=True, index=0, value=1.0))
             # Master's CONFIRM for fragment 1, then its CONFIRM for the
-            # unsolicited response; order is not guaranteed, so just drain 2.
+            # unsolicited response; order is not guaranteed.
             await peer.send_fragment(bytes(unsolicited))
-            await peer.read_fragments(2)
+            confirms.extend(await peer.read_fragments(2))
             await peer.send_fragment(analog_response(seq=1, fir=False, fin=True, con=False, index=1, value=2.0))
 
         responder = asyncio.create_task(respond())
@@ -530,6 +558,13 @@ class TestUnsolicited:
         assert handler.analog_inputs[0] == pytest.approx(1.0)
         assert handler.analog_inputs[1] == pytest.approx(2.0)
         assert handler.analog_inputs[99] == pytest.approx(7.0)
+        # Each CONFIRM mirrors the SEQ and UNS of the fragment it answers.
+        assert sorted(confirms) == sorted(
+            [
+                bytes([0xC0, FunctionCode.CONFIRM.value]),
+                bytes([0xD6, FunctionCode.CONFIRM.value]),
+            ]
+        )
 
 
 class TestLinkLayer:

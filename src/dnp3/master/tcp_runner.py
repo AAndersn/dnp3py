@@ -567,11 +567,11 @@ class MasterTcpRunner:
             logger.warning("Discarding %d bytes that did not parse as a response", len(data))
             return None
 
-        # An unsolicited response must be confirmed whether or not the master is
-        # mid-request; the outstation retries until it is.
-        if info.is_unsolicited and self.master.needs_confirm():
+        # An unsolicited response asking for CON must be confirmed whether or
+        # not the master is mid-request; the outstation retries until it is.
+        if info.is_unsolicited and info.con:
             logger.debug("Confirming unsolicited response seq=%d", info.sequence)
-            await self.send(self.master.build_confirm(self.master.get_confirm_sequence()))
+            await self.send(self.master.build_confirm(info.sequence, uns=True))
             self.master.on_confirm_sent()
 
         return info
