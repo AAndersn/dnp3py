@@ -277,25 +277,26 @@ class MasterTcpRunner:
         Raises:
             ResponseTimeoutError: No fragment arrived before the deadline, or
                 the burst as a whole outran `response_timeout`.
-            LinkError: The link failed or delivered unusable bytes.
+            LinkError: The link failed, a write did not complete before the
+                deadline, or the link delivered unusable bytes.
             MasterRunnerError: The channel is not open, a fragment broke the
                 burst's sequence walk, or the burst exceeded
                 `MAX_BURST_FRAGMENTS`.
         """
         self._require_open()
-        await self.send(request)
-
-        # One deadline for the whole exchange, not one per fragment: a per
-        # fragment deadline lets a peer that answers slowly but steadily hold
-        # the request open indefinitely.
+        # One deadline for the whole exchange, writes included, not one per
+        # fragment: a per fragment deadline lets a peer that answers slowly but
+        # steadily hold the request open indefinitely.
         deadline = self._deadline(None)
+        await self.send(request, deadline=deadline)
+
         burst = _Burst(expected_seq=request.header.control.seq)
         while True:
             info = await self._next_solicited(burst, deadline)
             burst.fragments.append(info)
 
             if info.con:
-                await self.send(self.master.build_confirm(info.sequence))
+                await self.send(self.master.build_confirm(info.sequence), deadline=deadline)
             if info.fin:
                 return burst.fragments
 
@@ -306,13 +307,21 @@ class MasterTcpRunner:
                 )
                 raise MasterRunnerError(msg)
 
-    async def send(self, request: RequestFragment) -> None:
+    async def send(self, request: RequestFragment, *, deadline: float | None = None) -> None:
         """Segment an application fragment and frame each segment onto the link.
 
         Args:
             request: Application request to transmit.
+            deadline: Event-loop time every write must finish by. None allows
+                `response_timeout` from now.
+
+        Raises:
+            LinkError: A write failed or did not complete before the deadline.
+            MasterRunnerError: The channel is not open.
         """
         self._require_open()
+        if deadline is None:
+            deadline = self._deadline(None)
         for segment in self._segmenter.segment(request.to_bytes()):
             await self._write_frame(
                 build_unconfirmed_user_data(
@@ -320,7 +329,8 @@ class MasterTcpRunner:
                     source=self.master.config.address,
                     dir_from_master=True,
                     user_data=segment.to_bytes(),
-                )
+                ),
+                deadline,
             )
 
     # -- unsolicited ----------------------------------------------------------
@@ -576,7 +586,7 @@ class MasterTcpRunner:
         # not the master is mid-request; the outstation retries until it is.
         if info.is_unsolicited and info.con:
             logger.debug("Confirming unsolicited response seq=%d", info.sequence)
-            await self.send(self.master.build_confirm(info.sequence, uns=True))
+            await self.send(self.master.build_confirm(info.sequence, uns=True), deadline=deadline)
             self.master.on_confirm_sent()
 
         return info
@@ -702,18 +712,35 @@ class MasterTcpRunner:
                 destination=self.master.config.outstation_address,
                 source=self.master.config.address,
                 dir_from_master=True,
-            )
+            ),
+            self._deadline(None),
         )
         logger.debug("Sent RESET_LINK_STATE to outstation %d", self.master.config.outstation_address)
 
-    async def _write_frame(self, frame: DataLinkFrame) -> None:
+    async def _write_frame(self, frame: DataLinkFrame, deadline: float) -> None:
         """Write one link frame to the channel.
+
+        Bounded because a peer that stops reading blocks the write forever
+        once the socket buffer fills, and TCP channels default to no write
+        timeout of their own.
 
         Args:
             frame: Frame to transmit.
+            deadline: Event-loop time the write must finish by.
+
+        Raises:
+            LinkError: The write failed or did not complete before the deadline.
         """
         channel, _ = self._require_open()
-        await channel.write_all(frame.to_bytes())
+        remaining = max(deadline - asyncio.get_running_loop().time(), 0.0)
+        try:
+            await asyncio.wait_for(channel.write_all(frame.to_bytes()), timeout=remaining)
+        except TimeoutError as exc:
+            msg = "Write to the outstation did not complete before the deadline"
+            raise LinkError(msg) from exc
+        except ChannelError as exc:
+            msg = f"Link failed while writing: {exc}"
+            raise LinkError(msg) from exc
 
     def _deadline(self, timeout: float | None) -> float:
         """Absolute event-loop time a wait should end at.

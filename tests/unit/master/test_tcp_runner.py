@@ -1351,6 +1351,72 @@ class TestPeerEof:
         assert runner.is_open is False
 
 
+class TestWriteFailure:
+    """Writes fail inside the runner's error hierarchy and inside its deadline."""
+
+    class FailingWriteChannel:
+        """Channel whose writes fail the way a reset socket does."""
+
+        is_open = True
+
+        async def write_all(self, data: bytes) -> None:
+            raise ChannelError("Write failed: Connection lost")
+
+        async def read(self, size: int) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        async def close(self) -> None:
+            self.is_open = False
+
+    class StalledWriteChannel:
+        """Channel whose writes never complete, as when the peer stops reading."""
+
+        is_open = True
+
+        async def write_all(self, data: bytes) -> None:
+            await asyncio.Event().wait()
+
+        async def read(self, size: int) -> bytes:
+            await asyncio.Event().wait()
+            return b""
+
+        async def close(self) -> None:
+            self.is_open = False
+
+    async def test_write_error_from_request_is_link_error(self) -> None:
+        """A failed write surfaces from `request()` as LinkError, with its cause."""
+        runner, _ = make_runner(self.FailingWriteChannel(), response_timeout=1.0)
+        await runner.open()
+
+        with pytest.raises(LinkError, match="Write failed") as raised:
+            await asyncio.wait_for(runner.integrity_poll(), timeout=2.0)
+        assert isinstance(raised.value.__cause__, ChannelError)
+
+    async def test_write_error_from_poll_is_link_error(self) -> None:
+        """A failed write surfaces from `poll()` as LinkError, and the task stays due."""
+        runner, _ = make_runner(self.FailingWriteChannel(), response_timeout=1.0)
+        await runner.open()
+        task = IntegrityPollTask()
+
+        with pytest.raises(LinkError, match="Write failed"):
+            await asyncio.wait_for(runner.poll(task), timeout=2.0)
+        assert task.is_due() is True
+
+    async def test_stalled_write_ends_at_the_deadline(self) -> None:
+        """A write that never completes is abandoned at the exchange deadline."""
+        runner, _ = make_runner(self.StalledWriteChannel(), response_timeout=0.3)
+        await runner.open()
+        loop = asyncio.get_running_loop()
+
+        started = loop.time()
+        with pytest.raises(LinkError, match="deadline"):
+            await asyncio.wait_for(runner.integrity_poll(), timeout=3.0)
+        elapsed = loop.time() - started
+
+        assert 0.25 <= elapsed < 1.0
+
+
 class TestPostCloseLifecycle:
     """State must not survive `close()` into the next connection."""
 
