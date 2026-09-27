@@ -274,8 +274,8 @@ class MasterTcpRunner:
             ResponseTimeoutError: No fragment arrived before the deadline, or
                 the burst as a whole outran `response_timeout`.
             LinkError: The link failed or delivered unusable bytes.
-            MasterRunnerError: The channel is not open, a fragment did not
-                correlate to this request, or the burst exceeded
+            MasterRunnerError: The channel is not open, a fragment broke the
+                burst's sequence walk, or the burst exceeded
                 `MAX_BURST_FRAGMENTS`.
         """
         self._require_open()
@@ -444,7 +444,7 @@ class MasterTcpRunner:
         Raises:
             ResponseTimeoutError: No fragment arrived before the deadline.
             LinkError: The link failed or delivered unusable bytes.
-            MasterRunnerError: The fragment did not correlate to the request.
+            MasterRunnerError: A fragment broke the burst's sequence walk.
         """
         while True:
             info = await self._receive_fragment(deadline, burst=burst)
@@ -467,11 +467,11 @@ class MasterTcpRunner:
             data: Reassembled application fragment.
 
         Returns:
-            True if the fragment should be parsed, False if it is not a response
-            at all and should be skipped.
+            True if the fragment should be parsed, False if it belongs to an
+            earlier request and should be dropped.
 
         Raises:
-            MasterRunnerError: The fragment did not correlate to the request.
+            MasterRunnerError: The fragment broke the burst's sequence walk.
         """
         try:
             header, _ = parse_response_header(data)
@@ -481,10 +481,9 @@ class MasterTcpRunner:
             return True
         if header.control.uns:
             return True
-        self._check_sequence(burst, header.control.seq)
-        return True
+        return self._check_sequence(burst, header.control.seq)
 
-    def _check_sequence(self, burst: _Burst, sequence: int) -> None:
+    def _check_sequence(self, burst: _Burst, sequence: int) -> bool:
         """Correlate a fragment to the request and its place in the burst.
 
         IEEE 1815-2012 clause 4.2.2.4.5: the first fragment carries the
@@ -493,10 +492,10 @@ class MasterTcpRunner:
         the same comparison does both jobs: it correlates fragment one to the
         request that is outstanding, and walks the rest.
 
-        Correlating matters most in the ordinary case, not the adversarial one:
-        without it, a late answer to a poll that already timed out is served as
-        the *next* poll's response, and stale values reach the SOE handler
-        looking current.
+        A first fragment that does not match is dropped rather than raised on.
+        It is almost always the late answer to a request that already timed
+        out, and failing the current request for it would leave the current
+        answer queued to fail the next request in turn, indefinitely.
 
         Tracked per burst rather than in `SequenceState`, whose
         `last_request_seq` is a request-sequence allocator with a different
@@ -506,15 +505,29 @@ class MasterTcpRunner:
             burst: Burst being accumulated.
             sequence: Application sequence the fragment carried.
 
+        Returns:
+            True if the fragment belongs to the burst, False if it is a first
+            fragment for some other request and was dropped.
+
         Raises:
-            MasterRunnerError: The sequence did not match.
+            MasterRunnerError: A later fragment broke the burst's sequence walk.
         """
         if sequence != burst.expected_seq:
+            if not burst.fragments:
+                logger.warning(
+                    "Dropping response fragment with sequence %d, expected %d for the outstanding request",
+                    sequence,
+                    burst.expected_seq,
+                )
+                return False
             position = len(burst.fragments) + 1
-            detail = "does not match the request" if not burst.fragments else "broke the burst's sequence walk"
-            msg = f"Response fragment {position} carried sequence {sequence}, expected {burst.expected_seq}: {detail}"
+            msg = (
+                f"Response fragment {position} carried sequence {sequence}, "
+                f"expected {burst.expected_seq}: broke the burst's sequence walk"
+            )
             raise MasterRunnerError(msg)
         burst.expected_seq = (sequence + 1) % (MAX_APP_SEQUENCE + 1)
+        return True
 
     async def _receive_fragment(
         self,
@@ -538,12 +551,13 @@ class MasterTcpRunner:
                 listening passes None, having no request to correlate against.
 
         Returns:
-            Info for the fragment, or None if it did not parse as a response.
+            Info for the fragment, or None if it did not parse as a response
+            or belonged to an earlier request.
 
         Raises:
             ResponseTimeoutError: The deadline passed, or the peer closed.
             LinkError: The link failed or delivered unusable bytes.
-            MasterRunnerError: The fragment did not correlate to the request.
+            MasterRunnerError: A fragment broke the burst's sequence walk.
         """
         data = await self._read_fragment_bytes(deadline)
         if burst is not None and not self._screen_solicited(burst, data):

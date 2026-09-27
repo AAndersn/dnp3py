@@ -890,11 +890,11 @@ class TestRequestCorrelation:
     """
 
     async def test_rejects_first_fragment_with_foreign_sequence(self) -> None:
-        """A fragment whose sequence is not the request's is refused."""
+        """A fragment whose sequence is not the request's is dropped, not served."""
         channel_a, channel_b = create_channel_pair()
         await channel_a.open()
         await channel_b.open()
-        runner, _ = make_runner(channel_a, response_timeout=1.0)
+        runner, handler = make_runner(channel_a, response_timeout=1.0)
         await runner.open()
         peer = FakeOutstation(channel_b)
 
@@ -906,9 +906,11 @@ class TestRequestCorrelation:
             )
 
         responder = asyncio.create_task(respond())
-        with pytest.raises(MasterRunnerError, match="does not match the request"):
+        with pytest.raises(ResponseTimeoutError):
             await runner.integrity_poll()
         await responder
+
+        assert 7 not in handler.analog_inputs
 
     async def test_late_response_is_not_served_as_the_next_poll(self) -> None:
         """The operational case: a timed-out poll's answer arriving during the next.
@@ -934,11 +936,59 @@ class TestRequestCorrelation:
             )
 
         responder = asyncio.create_task(respond_stale())
-        with pytest.raises(MasterRunnerError, match="does not match the request"):
+        with pytest.raises(ResponseTimeoutError):
             await runner.integrity_poll()
         await responder
 
         assert handler.analog_inputs.get(3) != -999.0, "a stale fragment's values must not reach the handler as current"
+
+    async def test_late_answer_does_not_desynchronize_later_polls(self, caplog: pytest.LogCaptureFixture) -> None:
+        """One timed-out poll must not make every later poll fail.
+
+        The late answer to poll one arrives ahead of poll two's own answer. It
+        is dropped unparsed and unconfirmed, and each later poll still receives
+        and delivers its own values.
+        """
+        channel_a, channel_b = create_channel_pair()
+        await channel_a.open()
+        await channel_b.open()
+        runner, handler = make_runner(channel_a, response_timeout=0.3)
+        await runner.open()
+        peer = FakeOutstation(channel_b)
+        function_codes: list[int] = []
+
+        first_seq = await asyncio.wait_for(_poll_and_time_out(runner, peer), timeout=5.0)
+        late_answer = analog_response(seq=first_seq, fir=True, fin=True, con=True, index=3, value=-999.0)
+
+        async def answer(poll_number: int) -> None:
+            request = (await peer.read_fragments(1))[0]
+            function_codes.append(request[1])
+            if poll_number == 0:
+                await peer.send_fragment(late_answer)
+            seq = request[0] & 0x0F
+            await peer.send_fragment(
+                analog_response(
+                    seq=seq, fir=True, fin=True, con=False, index=10 + poll_number, value=100.0 + poll_number
+                )
+            )
+
+        polls = 4
+        with caplog.at_level("WARNING", logger="dnp3.master.tcp_runner"):
+            for poll_number in range(polls):
+                responder = asyncio.create_task(answer(poll_number))
+                infos = await runner.integrity_poll()
+                await responder
+                assert len(infos) == 1
+                assert infos[0].sequence == (first_seq + 1 + poll_number) % 16
+                assert handler.analog_inputs[10 + poll_number] == pytest.approx(100.0 + poll_number)
+
+        assert 3 not in handler.analog_inputs, "the late answer's values must not be delivered"
+        assert function_codes == [FunctionCode.READ.value] * polls, "the dropped fragment must not be confirmed"
+        dropped = [r for r in caplog.records if "Dropping response fragment" in r.getMessage()]
+        assert len(dropped) == 1
+        assert dropped[0].levelname == "WARNING"
+        assert f"sequence {first_seq}," in dropped[0].getMessage()
+        assert f"expected {(first_seq + 1) % 16}" in dropped[0].getMessage()
 
 
 async def _poll_and_time_out(runner: MasterTcpRunner, peer: FakeOutstation) -> int:
