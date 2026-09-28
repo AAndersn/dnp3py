@@ -524,3 +524,78 @@ class TestTcpClientStatistics:
         finally:
             server.close()
             await server.wait_closed()
+
+
+class TestCloseIsBounded:
+    """close() finishes even when the peer has stopped reading.
+
+    A graceful close waits for the transport to flush its buffer, which never
+    happens once the peer's receive window is full.
+    """
+
+    # More than loopback socket buffers hold, so bytes stay queued in the transport.
+    STUFFING = b"\x00" * (32 * 1024 * 1024)
+
+    @staticmethod
+    async def _peer_that_never_reads() -> tuple[asyncio.Server, int, list[asyncio.StreamWriter]]:
+        writers: list[asyncio.StreamWriter] = []
+
+        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            writers.append(writer)
+
+        server = await asyncio.start_server(handler, host="127.0.0.1", port=0)
+        return server, server.sockets[0].getsockname()[1], writers
+
+    @staticmethod
+    async def _stop(server: asyncio.Server, writers: list[asyncio.StreamWriter]) -> None:
+        for writer in writers:
+            writer.transport.abort()
+        server.close()
+        await server.wait_closed()
+
+    async def test_close_with_unsent_bytes_is_bounded(self) -> None:
+        """Unsent bytes to a stalled peer are abandoned at the close bound."""
+        server, port, writers = await self._peer_that_never_reads()
+        try:
+            channel = TcpClientChannel(config=TcpConfig(host="127.0.0.1", port=port))
+            await channel.open()
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(channel.write_all(self.STUFFING), timeout=0.3)
+
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            await asyncio.wait_for(channel.close(), timeout=5.0)
+            elapsed = loop.time() - started
+
+            assert channel.close_timeout * 0.9 <= elapsed < channel.close_timeout + 1.0
+            assert channel.state == ChannelState.CLOSED
+            assert channel.statistics.disconnect_count == 1
+        finally:
+            await self._stop(server, writers)
+
+    async def test_close_to_a_reading_peer_still_delivers_every_byte(self) -> None:
+        """The bound does not truncate a healthy close: the peer gets all bytes, then EOF."""
+        received = bytearray()
+        done = asyncio.Event()
+
+        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            while chunk := await reader.read(65536):
+                received.extend(chunk)
+            done.set()
+            writer.close()
+
+        server = await asyncio.start_server(handler, host="127.0.0.1", port=0)
+        port = server.sockets[0].getsockname()[1]
+        payload = bytes(range(256)) * 4096
+        try:
+            channel = TcpClientChannel(config=TcpConfig(host="127.0.0.1", port=port))
+            await channel.open()
+            channel._writer.write(payload)  # type: ignore[union-attr]
+            await channel.close()
+            await asyncio.wait_for(done.wait(), timeout=5.0)
+
+            assert bytes(received) == payload
+            assert channel.state == ChannelState.CLOSED
+        finally:
+            server.close()
+            await server.wait_closed()

@@ -27,9 +27,12 @@ class TcpClientChannel:
 
     Attributes:
         config: TCP configuration.
+        close_timeout: Seconds close() waits for unsent bytes to drain before
+            aborting the connection.
     """
 
     config: TcpConfig = field(default_factory=TcpConfig)
+    close_timeout: float = 1.0
 
     _state: ChannelState = field(default=ChannelState.CLOSED, init=False)
     _statistics: ChannelStatistics = field(default_factory=ChannelStatistics, init=False)
@@ -147,7 +150,10 @@ class TcpClientChannel:
                 )
 
     async def close(self) -> None:
-        """Close the channel gracefully."""
+        """Close the channel, gracefully if the peer lets it.
+
+        Waits at most `close_timeout` for unsent bytes to drain, then aborts.
+        """
         if self._state == ChannelState.CLOSED:
             return
 
@@ -156,7 +162,11 @@ class TcpClientChannel:
         if self._writer is not None:
             try:
                 self._writer.close()
-                await self._writer.wait_closed()
+                await asyncio.wait_for(self._writer.wait_closed(), timeout=self.close_timeout)
+            except TimeoutError:
+                # A peer that stopped reading never drains the send buffer, so a
+                # graceful close would wait forever.
+                self._writer.transport.abort()
             except (OSError, ConnectionError):
                 pass  # Ignore errors during close
 

@@ -1482,3 +1482,91 @@ class TestPostCloseLifecycle:
 
         with pytest.raises(MasterRunnerError, match="already open"):
             await runner.open()
+
+
+class TestCloseOverStalledSocket:
+    """Every close the runner takes finishes when the peer has stopped reading.
+
+    These need a real socket: the hang is in the TCP transport's graceful close,
+    which waits for a send buffer the stalled peer never drains.
+    """
+
+    # More than loopback socket buffers hold, so bytes stay queued in the transport.
+    STUFFING = b"\x00" * (32 * 1024 * 1024)
+    # TcpClientChannel.close_timeout plus scheduling slack.
+    CLOSE_BOUND = 2.0
+
+    @staticmethod
+    async def _stalled_runner(
+        response_timeout: float,
+    ) -> tuple[MasterTcpRunner, asyncio.Server, list[asyncio.StreamWriter]]:
+        """Open a runner on a socket whose peer never reads, with its send path jammed."""
+        writers: list[asyncio.StreamWriter] = []
+
+        async def handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+            writers.append(writer)
+
+        server = await asyncio.start_server(handler, host="127.0.0.1", port=0)
+        master = Master(
+            config=MasterConfig(address=MASTER_ADDR, outstation_address=OUTSTATION_ADDR),
+            handler=RecordingHandler(),
+        )
+        runner = MasterTcpRunner(
+            master=master,
+            host="127.0.0.1",
+            port=server.sockets[0].getsockname()[1],
+            link_reset=LinkResetPolicy.NEVER,
+            response_timeout=response_timeout,
+        )
+        await runner.open()
+        assert runner.channel is not None
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(runner.channel.write_all(TestCloseOverStalledSocket.STUFFING), timeout=0.3)
+        for _ in range(100):
+            if writers:
+                break
+            await asyncio.sleep(0.01)
+        assert writers, "server never accepted the connection"
+        return runner, server, writers
+
+    @staticmethod
+    async def _stop(server: asyncio.Server, writers: list[asyncio.StreamWriter]) -> None:
+        for writer in writers:
+            writer.transport.abort()
+        server.close()
+        await server.wait_closed()
+
+    async def test_peer_eof_close_is_bounded(self) -> None:
+        """EOF from a peer that stopped reading raises LinkError within the bound."""
+        runner, server, writers = await self._stalled_runner(response_timeout=5.0)
+        try:
+            writers[0].write_eof()
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            with pytest.raises(LinkError, match="Peer closed the connection"):
+                await asyncio.wait_for(runner.listen_unsolicited(timeout=5.0), timeout=8.0)
+            elapsed = loop.time() - started
+
+            assert elapsed < self.CLOSE_BOUND
+            assert runner.is_open is False
+            assert runner.channel is None
+        finally:
+            await self._stop(server, writers)
+
+    async def test_close_after_write_timeout_is_bounded(self) -> None:
+        """A caller's close() after a write timed out returns within the bound."""
+        runner, server, writers = await self._stalled_runner(response_timeout=0.3)
+        try:
+            with pytest.raises(LinkError, match="did not complete before the deadline"):
+                await asyncio.wait_for(runner.integrity_poll(), timeout=3.0)
+
+            loop = asyncio.get_running_loop()
+            started = loop.time()
+            await asyncio.wait_for(runner.close(), timeout=8.0)
+            elapsed = loop.time() - started
+
+            assert elapsed < self.CLOSE_BOUND
+            assert runner.is_open is False
+            assert runner.channel is None
+        finally:
+            await self._stop(server, writers)
