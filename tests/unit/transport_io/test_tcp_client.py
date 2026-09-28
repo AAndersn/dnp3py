@@ -562,14 +562,50 @@ class TestCloseIsBounded:
             with pytest.raises(TimeoutError):
                 await asyncio.wait_for(channel.write_all(self.STUFFING), timeout=0.3)
 
+            sock = channel._writer.get_extra_info("socket")  # type: ignore[union-attr]
+
             loop = asyncio.get_running_loop()
             started = loop.time()
             await asyncio.wait_for(channel.close(), timeout=5.0)
             elapsed = loop.time() - started
 
-            assert channel.close_timeout * 0.9 <= elapsed < channel.close_timeout + 1.0
+            assert channel.config.close_timeout * 0.9 <= elapsed < channel.config.close_timeout + 1.0
             assert channel.state == ChannelState.CLOSED
             assert channel.statistics.disconnect_count == 1
+
+            # abort() closes the transport asynchronously (scheduled via
+            # call_soon); poll rather than assume it has run by the time
+            # close() returns.
+            deadline = loop.time() + 1.0
+            while sock.fileno() != -1 and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            assert sock.fileno() == -1, "a stalled close must abort the transport, not merely time out"
+        finally:
+            await self._stop(server, writers)
+
+    async def test_close_cancelled_mid_wait_still_aborts_transport(self) -> None:
+        """Cancelling close() during the bounded wait still aborts the socket."""
+        server, port, writers = await self._peer_that_never_reads()
+        try:
+            channel = TcpClientChannel(config=TcpConfig(host="127.0.0.1", port=port, close_timeout=5.0))
+            await channel.open()
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(channel.write_all(self.STUFFING), timeout=0.3)
+
+            sock = channel._writer.get_extra_info("socket")  # type: ignore[union-attr]
+
+            close_task = asyncio.create_task(channel.close())
+            await asyncio.sleep(0.05)  # let close() start its bounded wait
+            close_task.cancel()
+
+            with pytest.raises(asyncio.CancelledError):
+                await close_task
+
+            loop = asyncio.get_running_loop()
+            deadline = loop.time() + 1.0
+            while sock.fileno() != -1 and loop.time() < deadline:
+                await asyncio.sleep(0.01)
+            assert sock.fileno() == -1, "a cancelled close must still abort the transport"
         finally:
             await self._stop(server, writers)
 
