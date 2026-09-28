@@ -41,7 +41,7 @@ from dnp3.master.tcp_runner import (
 )
 from dnp3.transport.segment import TransportSegment
 from dnp3.transport_io.channel import ChannelError
-from dnp3.transport_io.simulator import create_channel_pair
+from dnp3.transport_io.simulator import SimulatorChannel, create_channel_pair
 
 MASTER_ADDR = 3
 OUTSTATION_ADDR = 1
@@ -1570,3 +1570,70 @@ class TestCloseOverStalledSocket:
             assert runner.channel is None
         finally:
             await self._stop(server, writers)
+
+
+class TestFailedOpen:
+    """A failed open() leaves nothing half-open and can be retried."""
+
+    async def test_failed_link_reset_leaves_runner_closed_and_reopenable(self) -> None:
+        """A reset that fails to write closes the runner; a later open() succeeds."""
+        channel_a, channel_b = create_channel_pair()
+        await channel_a.open()
+        await channel_b.open()
+        await channel_b.close()  # no peer left, so the reset write fails
+        runner, _ = make_runner(channel_a, link_reset=LinkResetPolicy.ON_OPEN)
+
+        with pytest.raises(LinkError, match="Link failed while writing") as raised:
+            await runner.open()
+
+        assert isinstance(raised.value.__cause__, ChannelError)
+        assert runner.is_open is False
+        assert runner._reassembler is None
+        assert channel_a.is_open, "an injected channel belongs to its owner"
+
+        channel_c, channel_d = create_channel_pair()
+        await channel_c.open()
+        await channel_d.open()
+        runner.channel = channel_c
+        await runner.open()
+
+        assert runner.is_open is True
+        frames = list(FrameParser().feed(await asyncio.wait_for(channel_d.read(4096), timeout=1.0)))
+        assert [f.header.control.function_code for f in frames] == [LinkFunctionCode.PRI_RESET_LINK_STATE.value]
+
+    async def test_failed_open_closes_an_owned_channel(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """A channel the runner created is closed and dropped when open() fails."""
+        created: list[SimulatorChannel] = []
+        peers: list[SimulatorChannel] = []
+
+        def factory(config: object) -> SimulatorChannel:
+            if not created:
+                channel = SimulatorChannel()  # no peer, so the reset write fails
+            else:
+                channel, peer = create_channel_pair()
+                peers.append(peer)
+            created.append(channel)
+            return channel
+
+        monkeypatch.setattr("dnp3.master.tcp_runner.TcpClientChannel", factory)
+        master = Master(
+            config=MasterConfig(address=MASTER_ADDR, outstation_address=OUTSTATION_ADDR),
+            handler=RecordingHandler(),
+        )
+        runner = MasterTcpRunner(master=master, link_reset=LinkResetPolicy.ON_OPEN, response_timeout=1.0)
+
+        with pytest.raises(LinkError, match="No peer connected"):
+            await runner.open()
+
+        assert created[0].is_open is False
+        assert runner.channel is None
+        assert runner.is_open is False
+
+        await runner.open()
+
+        assert len(created) == 2
+        assert runner.channel is created[1]
+        assert runner.is_open is True
+        await peers[0].open()
+        frames = list(FrameParser().feed(await asyncio.wait_for(peers[0].read(4096), timeout=1.0)))
+        assert [f.header.control.function_code for f in frames] == [LinkFunctionCode.PRI_RESET_LINK_STATE.value]

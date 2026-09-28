@@ -167,10 +167,14 @@ class MasterTcpRunner:
     async def open(self) -> None:
         """Open the channel and, by policy, reset the data link.
 
+        On any failure the runner is closed again, together with a channel it
+        created, so a later `open()` starts clean.
+
         Raises:
             MasterRunnerError: The runner is already open. Re-opening would
                 replace the reassembler and re-send RESET_LINK_STATE underneath
                 any in-flight request.
+            LinkError: The link reset could not be written.
         """
         # `_reassembler`, not `is_open`: an injected channel is often already
         # open before the runner touches it, and opening the runner over it is
@@ -185,20 +189,24 @@ class MasterTcpRunner:
             self.channel = TcpClientChannel(config=TcpConfig(host=self.host, port=self.port))
             self._owns_channel = True
 
-        if not self.channel.is_open:
-            await self.channel.open()
+        try:
+            if not self.channel.is_open:
+                await self.channel.open()
 
-        # Bound reassembly by the master's own fragment cap so a peer that never
-        # sets FIN cannot exhaust memory.
-        self._reassembler = Reassembler(max_fragment_size=self.master.config.max_fragment_size)
-        # A previous connection may have left a partial frame mid-parse and
-        # frames unconsumed; neither belongs in this connection's stream.
-        self._parser.reset()
-        self._pending.clear()
-        logger.info("Master connected to %s:%d", self.host, self.port)
+            # Bound reassembly by the master's own fragment cap so a peer that
+            # never sets FIN cannot exhaust memory.
+            self._reassembler = Reassembler(max_fragment_size=self.master.config.max_fragment_size)
+            # A previous connection may have left a partial frame mid-parse and
+            # frames unconsumed; neither belongs in this connection's stream.
+            self._parser.reset()
+            self._pending.clear()
+            logger.info("Master connected to %s:%d", self.host, self.port)
 
-        if self.link_reset is LinkResetPolicy.ON_OPEN:
-            await self._send_link_reset()
+            if self.link_reset is LinkResetPolicy.ON_OPEN:
+                await self._send_link_reset()
+        except BaseException:
+            await self.close()
+            raise
 
     async def close(self) -> None:
         """Close the channel if this runner opened it, and clear protocol state.
@@ -207,14 +215,16 @@ class MasterTcpRunner:
         runner's own state is dropped either way: a reused runner must not
         reassemble the next connection's bytes onto the last one's remnants.
         """
-        if self.channel is not None and self._owns_channel:
-            await self.channel.close()
-            self.channel = None
-            self._owns_channel = False
-
-        self._reassembler = None
-        self._parser.reset()
-        self._pending.clear()
+        try:
+            if self.channel is not None and self._owns_channel:
+                await self.channel.close()
+        finally:
+            if self._owns_channel:
+                self.channel = None
+                self._owns_channel = False
+            self._reassembler = None
+            self._parser.reset()
+            self._pending.clear()
 
     async def __aenter__(self) -> MasterTcpRunner:
         await self.open()
