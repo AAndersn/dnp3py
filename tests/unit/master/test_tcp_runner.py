@@ -1753,7 +1753,7 @@ class TestSpentDeadline:
 
         delivered = handler.on_analog_input
 
-        def slow_handler(values: list, info: ResponseInfo) -> None:
+        def slow_handler(values: list[object], info: ResponseInfo) -> None:
             delivered(values, info)
             time.sleep(0.4)  # outlasts response_timeout while the fragment is processed
 
