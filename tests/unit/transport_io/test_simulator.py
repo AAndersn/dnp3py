@@ -324,6 +324,26 @@ class TestChannelPairCommunication:
         assert await a.read(100) == b"fresh"
 
     @pytest.mark.asyncio
+    async def test_completed_read_does_not_leave_stale_parked_count(self) -> None:
+        """A read that already returned does not leave close() thinking one is
+        still parked: that would queue a false EOF for the channel's next life
+        after close() and open().
+        """
+        config = SimulatorConfig(read_timeout=0.1)
+        a, b = create_channel_pair(config=config)
+        await a.open()
+        await b.open()
+
+        await b.write(b"x")
+        assert await a.read(1) == b"x"  # parks on the queue, then completes
+
+        await a.close()
+        await a.open()
+
+        with pytest.raises(ChannelTimeoutError):
+            await a.read(1)
+
+    @pytest.mark.asyncio
     async def test_reopened_channel_still_sees_peer_eof(self) -> None:
         """After a reopen, a genuine peer close still reads as EOF."""
         a, b = create_channel_pair()
