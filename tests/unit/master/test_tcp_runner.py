@@ -877,6 +877,37 @@ class TestReceiveEdgeCases:
 
         assert await runner.listen_unsolicited(timeout=0.3) is None
 
+    async def test_listen_does_not_deliver_solicited_values(self, caplog: pytest.LogCaptureFixture) -> None:
+        """A solicited fragment's values never reach the handler while listening.
+
+        Only its header is read; the drop is logged, and a later unsolicited
+        report on the same listen is still delivered.
+        """
+        channel_a, channel_b = create_channel_pair()
+        await channel_a.open()
+        await channel_b.open()
+        runner, handler = make_runner(channel_a)
+        await runner.open()
+        peer = FakeOutstation(channel_b)
+
+        unsolicited = bytearray(analog_response(seq=5, fir=True, fin=True, con=False, index=9, value=42.0))
+        unsolicited[0] |= 0x10  # UNS bit
+        unsolicited[1] = FunctionCode.UNSOLICITED_RESPONSE.value
+        await peer.send_fragment(analog_response(seq=3, fir=True, fin=True, con=False, index=0, value=-777.0))
+        await peer.send_fragment(bytes(unsolicited))
+
+        with caplog.at_level("WARNING", logger="dnp3.master.tcp_runner"):
+            info = await runner.listen_unsolicited(timeout=1.0)
+
+        assert 0 not in handler.analog_inputs
+        assert info is not None
+        assert info.is_unsolicited is True
+        assert info.sequence == 5
+        assert handler.analog_inputs == {9: pytest.approx(42.0)}
+        dropped = [r for r in caplog.records if "solicited" in r.getMessage() and "sequence 3" in r.getMessage()]
+        assert len(dropped) == 1
+        assert dropped[0].levelname == "WARNING"
+
     async def test_closed_channel_raises_runner_error(self) -> None:
         """A closed channel is one condition with one exception type.
 

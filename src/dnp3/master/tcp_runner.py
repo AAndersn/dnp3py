@@ -398,7 +398,8 @@ class MasterTcpRunner:
 
         Values reach the SOE handler as a side effect of parsing, the same as for
         a poll. Use this when the master is otherwise idle; unsolicited responses
-        that arrive mid-request are handled inline by `request()`.
+        that arrive mid-request are handled inline by `request()`. A solicited
+        fragment arriving meanwhile is dropped unparsed and logged.
 
         `None` means "nothing arrived in time" and nothing more. A link that
         has failed raises `LinkError` rather than returning `None`, so a caller
@@ -507,6 +508,32 @@ class MasterTcpRunner:
             return True
         return self._check_sequence(burst, header.control.seq)
 
+    def _screen_unsolicited(self, data: bytes) -> bool:
+        """Reject a solicited fragment while listening, before its values are parsed.
+
+        With no request outstanding a solicited fragment answers nothing; parsing
+        it would hand its values to the SOE handler as though they were current.
+
+        Args:
+            data: Reassembled application fragment.
+
+        Returns:
+            True if the fragment should be parsed, False if it was dropped.
+        """
+        try:
+            header, _ = parse_response_header(data)
+        except (ParseError, ValueError, IndexError):
+            # Not a parseable response header; let process_response log and
+            # discard it through the existing path.
+            return True
+        if header.control.uns:
+            return True
+        logger.warning(
+            "Dropping solicited response fragment with sequence %d while listening for unsolicited responses",
+            header.control.seq,
+        )
+        return False
+
     def _check_sequence(self, burst: _Burst, sequence: int) -> bool:
         """Correlate a fragment to the request and its place in the burst.
 
@@ -572,7 +599,8 @@ class MasterTcpRunner:
         Args:
             deadline: Event-loop time after which to give up.
             burst: Solicited burst being accumulated, if any. Unsolicited
-                listening passes None, having no request to correlate against.
+                listening passes None, and then only unsolicited fragments are
+                parsed.
 
         Returns:
             Info for the fragment, or None if it did not parse as a response
@@ -585,7 +613,10 @@ class MasterTcpRunner:
             MasterRunnerError: A fragment broke the burst's sequence walk.
         """
         data = await self._read_fragment_bytes(deadline)
-        if burst is not None and not self._screen_solicited(burst, data):
+        if burst is None:
+            if not self._screen_unsolicited(data):
+                return None
+        elif not self._screen_solicited(burst, data):
             return None
         info = self.master.process_response(data)
         if info is None:
