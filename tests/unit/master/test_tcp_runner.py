@@ -328,6 +328,31 @@ class TestSingleFragment:
             await asyncio.wait_for(channel_b.read(4096), timeout=0.2)
 
 
+    async def test_final_fragment_with_con_is_confirmed(self) -> None:
+        """A FIN fragment that sets CON is confirmed before the exchange returns."""
+        channel_a, channel_b = create_channel_pair()
+        await channel_a.open()
+        await channel_b.open()
+        runner, handler = make_runner(channel_a)
+        await runner.open()
+        peer = FakeOutstation(channel_b)
+        seq_holder: list[int] = []
+
+        async def respond() -> None:
+            seq = await peer.read_request_seq()
+            seq_holder.append(seq)
+            await peer.send_fragment(analog_response(seq=seq, fir=True, fin=True, con=True, index=3, value=9.5))
+
+        responder = asyncio.create_task(respond())
+        infos = await runner.integrity_poll()
+        await responder
+
+        assert [(i.fin, i.con) for i in infos] == [(True, True)]
+        assert handler.analog_inputs[3] == pytest.approx(9.5)
+        confirms = await peer.read_fragments(1, timeout=0.5)
+        assert confirms == [bytes([0xC0 | seq_holder[0], FunctionCode.CONFIRM.value])]
+
+
 class TestMultiFragment:
     """Bursts that span fragments, with the CONFIRM handshake."""
 
