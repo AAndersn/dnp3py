@@ -251,6 +251,61 @@ class TestChannelPairCommunication:
         with pytest.raises(ChannelClosedError, match="EOF"):
             await b.read_exactly(10)
 
+    @pytest.mark.asyncio
+    async def test_read_parked_own_close_raises_closed(self) -> None:
+        """A read already parked on this channel's own queue is woken by
+        this channel's own close(), not left waiting for its read timeout.
+        """
+        config = SimulatorConfig(read_timeout=0.2)
+        a, _b = create_channel_pair(config=config)
+        await a.open()
+        await _b.open()
+
+        read_task = asyncio.create_task(a.read(100))
+        await asyncio.sleep(0)  # let read() park on the empty queue
+
+        await a.close()
+
+        with pytest.raises(ChannelClosedError, match="not open"):
+            await read_task
+
+    @pytest.mark.asyncio
+    async def test_read_parked_peer_close_still_returns_eof(self) -> None:
+        """A read parked while this channel stays OPEN still returns b""
+        (EOF) when the PEER closes: only this channel's own close() raises.
+        """
+        a, b = create_channel_pair()
+        await a.open()
+        await b.open()
+
+        read_task = asyncio.create_task(b.read(100))
+        await asyncio.sleep(0)  # let read() park on the empty queue
+
+        await a.close()  # peer of b; b itself stays open
+
+        assert await read_task == b""
+        assert b.state == ChannelState.OPEN
+
+    @pytest.mark.asyncio
+    async def test_close_with_peer_queue_full_does_not_raise(self) -> None:
+        """close() suppresses QueueFull when the peer's own queue has no
+        room left for the EOF sentinel it signals to the peer.
+
+        b's own queue is drained by its own close() before b ever signals
+        itself, so b's queue can never be observed full at that point; the
+        reachable full-queue case is the peer signal a.close() sends to b.
+        """
+        config = SimulatorConfig(buffer_size=1)
+        a, b = create_channel_pair(config=config)
+        await a.open()
+        await b.open()
+
+        await a.write(b"x")  # fills b's read queue to its capacity of 1
+
+        await a.close()  # signals EOF into b's already-full queue; must not raise
+
+        assert a.state == ChannelState.CLOSED
+
 
 class TestChannelPairFactory:
     """Tests for create_channel_pair factory."""
