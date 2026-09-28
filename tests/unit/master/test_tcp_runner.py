@@ -327,7 +327,6 @@ class TestSingleFragment:
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(channel_b.read(4096), timeout=0.2)
 
-
     async def test_final_fragment_with_con_is_confirmed(self) -> None:
         """A FIN fragment that sets CON is confirmed before the exchange returns."""
         channel_a, channel_b = create_channel_pair()
