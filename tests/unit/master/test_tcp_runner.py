@@ -203,6 +203,13 @@ def analog_response(*, seq: int, fir: bool, fin: bool, con: bool, index: int, va
     return bytes(data)
 
 
+class _RaisingCloseChannel(SimulatorChannel):
+    """A channel whose close() always raises, to prove cleanup still runs."""
+
+    async def close(self) -> None:
+        raise ChannelError("boom")
+
+
 def make_runner(
     channel: object,
     *,
@@ -1549,7 +1556,7 @@ class TestCloseOverStalledSocket:
 
     # More than loopback socket buffers hold, so bytes stay queued in the transport.
     STUFFING = b"\x00" * (32 * 1024 * 1024)
-    # TcpClientChannel.close_timeout plus scheduling slack.
+    # TcpConfig.close_timeout plus scheduling slack.
     CLOSE_BOUND = 2.0
 
     @staticmethod
@@ -1646,6 +1653,7 @@ class TestFailedOpen:
         assert runner.is_open is False
         assert runner._reassembler is None
         assert channel_a.is_open, "an injected channel belongs to its owner"
+        assert runner.channel is channel_a, "an injected channel is not dropped on a failed open"
 
         channel_c, channel_d = create_channel_pair()
         await channel_c.open()
@@ -1656,6 +1664,30 @@ class TestFailedOpen:
         assert runner.is_open is True
         frames = list(FrameParser().feed(await asyncio.wait_for(channel_d.read(4096), timeout=1.0)))
         assert [f.header.control.function_code for f in frames] == [LinkFunctionCode.PRI_RESET_LINK_STATE.value]
+
+    async def test_failed_open_clears_state_even_when_channel_close_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """close() raising during a failed open() still clears the runner's
+        state: cleanup runs from a `finally`, not after an unguarded call.
+        """
+
+        def factory(config: object) -> SimulatorChannel:
+            return _RaisingCloseChannel()  # no peer, so the link reset write fails
+
+        monkeypatch.setattr("dnp3.master.tcp_runner.TcpClientChannel", factory)
+        master = Master(
+            config=MasterConfig(address=MASTER_ADDR, outstation_address=OUTSTATION_ADDR),
+            handler=RecordingHandler(),
+        )
+        runner = MasterTcpRunner(master=master, link_reset=LinkResetPolicy.ON_OPEN, response_timeout=1.0)
+
+        with pytest.raises(ChannelError, match="boom"):
+            await runner.open()
+
+        assert runner.channel is None
+        assert runner._owns_channel is False
+        assert runner._reassembler is None
 
     async def test_failed_open_closes_an_owned_channel(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """A channel the runner created is closed and dropped when open() fails."""
