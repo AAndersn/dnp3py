@@ -60,6 +60,14 @@ real burst is bounded by the outstation's own database size; this cap is set far
 above any legitimate response so it only fires on a peer that will not stop.
 """
 
+CONFIRM_WRITE_BUDGET = 0.5
+"""Seconds a CONFIRM for already-delivered values may take, however little of
+the exchange deadline is left.
+
+Without a floor a CONFIRM owed as the deadline passes is abandoned before it is
+written, and the outstation resends values the handler already has.
+"""
+
 _USER_DATA_FUNCTION_CODES = frozenset(
     {
         LinkFunctionCode.PRI_UNCONFIRMED_USER_DATA,
@@ -306,7 +314,7 @@ class MasterTcpRunner:
             burst.fragments.append(info)
 
             if info.con:
-                await self.send(self.master.build_confirm(info.sequence), deadline=deadline)
+                await self._send_confirm(info.sequence, uns=False, deadline=deadline)
             if info.fin:
                 return burst.fragments
 
@@ -316,6 +324,21 @@ class MasterTcpRunner:
                     "without setting FIN; abandoning the exchange"
                 )
                 raise MasterRunnerError(msg)
+
+    async def _send_confirm(self, sequence: int, *, uns: bool, deadline: float) -> None:
+        """Confirm a fragment whose values were already delivered.
+
+        Args:
+            sequence: Sequence of the fragment being confirmed.
+            uns: Whether the fragment was unsolicited.
+            deadline: Exchange deadline; the write gets at least
+                `CONFIRM_WRITE_BUDGET` beyond now even when it has passed.
+
+        Raises:
+            LinkError: The write failed or did not complete in its budget.
+        """
+        budget_end = asyncio.get_running_loop().time() + CONFIRM_WRITE_BUDGET
+        await self.send(self.master.build_confirm(sequence, uns=uns), deadline=max(deadline, budget_end))
 
     async def send(self, request: RequestFragment, *, deadline: float | None = None) -> None:
         """Segment an application fragment and frame each segment onto the link.
@@ -627,7 +650,7 @@ class MasterTcpRunner:
         # not the master is mid-request; the outstation retries until it is.
         if info.is_unsolicited and info.con:
             logger.debug("Confirming unsolicited response seq=%d", info.sequence)
-            await self.send(self.master.build_confirm(info.sequence, uns=True), deadline=deadline)
+            await self._send_confirm(info.sequence, uns=True, deadline=deadline)
             self.master.on_confirm_sent()
 
         return info
@@ -651,6 +674,12 @@ class MasterTcpRunner:
         """
         channel, reassembler = self._require_open()
         loop = asyncio.get_running_loop()
+        # Checked before queued frames are consumed, so a spent deadline takes
+        # nothing: the frames wait for the next call rather than delivering
+        # values whose CONFIRM would then have no time left.
+        if deadline <= loop.time():
+            msg = "Timed out waiting for a response fragment"
+            raise ResponseTimeoutError(msg)
 
         while True:
             # Frames already parsed but not yet consumed come first: one read can

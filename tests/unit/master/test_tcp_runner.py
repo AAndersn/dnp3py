@@ -15,6 +15,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import struct
+import time
 
 import pytest
 
@@ -1668,3 +1669,90 @@ class TestFailedOpen:
         await peers[0].open()
         frames = list(FrameParser().feed(await asyncio.wait_for(peers[0].read(4096), timeout=1.0)))
         assert [f.header.control.function_code for f in frames] == [LinkFunctionCode.PRI_RESET_LINK_STATE.value]
+
+
+class TestSpentDeadline:
+    """A spent deadline stops new work but never strands a CONFIRM already owed.
+
+    Rule: a fragment is not taken for processing once the deadline has passed,
+    so its values are not delivered and it stays queued for a later call; a
+    CONFIRM owed for values already delivered is written with a minimum budget
+    rather than with the time left, which may be none.
+    """
+
+    @staticmethod
+    def _unsolicited(seq: int, index: int, value: float) -> bytes:
+        data = bytearray(analog_response(seq=seq, fir=True, fin=True, con=True, index=index, value=value))
+        data[0] |= 0x10  # UNS bit
+        data[1] = FunctionCode.UNSOLICITED_RESPONSE.value
+        return bytes(data)
+
+    async def test_queued_fragment_is_not_delivered_on_a_spent_deadline(self) -> None:
+        """listen_unsolicited(timeout=0) delivers nothing and leaves the fragment queued."""
+        channel_a, channel_b = create_channel_pair()
+        await channel_a.open()
+        await channel_b.open()
+        runner, handler = make_runner(channel_a)
+        await runner.open()
+        peer = FakeOutstation(channel_b)
+
+        # Both frames in one read: the second waits in the runner's frame queue.
+        await peer.send_raw(
+            peer.frame_fragment(self._unsolicited(4, index=1, value=10.0))
+            + peer.frame_fragment(self._unsolicited(5, index=2, value=20.0))
+        )
+        first = await runner.listen_unsolicited(timeout=1.0)
+        assert first is not None
+        assert first.sequence == 4
+        assert await peer.read_fragments(1) == [bytes([0xD4, FunctionCode.CONFIRM.value])]
+
+        assert await runner.listen_unsolicited(timeout=0) is None
+        assert 2 not in handler.analog_inputs
+        assert runner.is_open is True
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(channel_b.read(4096), timeout=0.2)
+
+        second = await runner.listen_unsolicited(timeout=1.0)
+        assert second is not None
+        assert second.sequence == 5
+        assert handler.analog_inputs == {1: pytest.approx(10.0), 2: pytest.approx(20.0)}
+        assert await peer.read_fragments(1) == [bytes([0xD5, FunctionCode.CONFIRM.value])]
+
+    async def test_confirm_owed_after_the_deadline_is_still_written(self) -> None:
+        """Values delivered as the deadline passes are confirmed; the next fragment is not taken."""
+        channel_a, channel_b = create_channel_pair()
+        await channel_a.open()
+        await channel_b.open()
+        runner, handler = make_runner(channel_a, response_timeout=0.3)
+        await runner.open()
+        peer = FakeOutstation(channel_b)
+
+        delivered = handler.on_analog_input
+
+        def slow_handler(values: list, info: ResponseInfo) -> None:
+            delivered(values, info)
+            time.sleep(0.4)  # outlasts response_timeout while the fragment is processed
+
+        handler.on_analog_input = slow_handler  # type: ignore[method-assign]
+        confirms: list[bytes] = []
+
+        async def respond() -> None:
+            seq = await peer.read_request_seq()
+            await peer.send_raw(
+                peer.frame_fragment(analog_response(seq=seq, fir=True, fin=False, con=True, index=0, value=1.0))
+                + peer.frame_fragment(
+                    analog_response(seq=(seq + 1) % 16, fir=False, fin=True, con=False, index=1, value=2.0)
+                )
+            )
+            confirms.extend(await peer.read_fragments(1))
+            seq_holder.append(seq)
+
+        seq_holder: list[int] = []
+        responder = asyncio.create_task(respond())
+        with pytest.raises(ResponseTimeoutError, match="Timed out"):
+            await runner.integrity_poll()
+        await responder
+
+        assert handler.analog_inputs == {0: pytest.approx(1.0)}
+        assert confirms == [bytes([0xC0 | seq_holder[0], FunctionCode.CONFIRM.value])]
+        assert runner.is_open is True
