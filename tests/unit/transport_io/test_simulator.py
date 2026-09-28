@@ -288,12 +288,8 @@ class TestChannelPairCommunication:
 
     @pytest.mark.asyncio
     async def test_close_with_peer_queue_full_does_not_raise(self) -> None:
-        """close() suppresses QueueFull when the peer's own queue has no
-        room left for the EOF sentinel it signals to the peer.
-
-        b's own queue is drained by its own close() before b ever signals
-        itself, so b's queue can never be observed full at that point; the
-        reachable full-queue case is the peer signal a.close() sends to b.
+        """close() completes when the peer's queue has no room for the EOF
+        sentinel, and the data already queued there is not lost.
         """
         config = SimulatorConfig(buffer_size=1)
         a, b = create_channel_pair(config=config)
@@ -302,9 +298,45 @@ class TestChannelPairCommunication:
 
         await a.write(b"x")  # fills b's read queue to its capacity of 1
 
-        await a.close()  # signals EOF into b's already-full queue; must not raise
+        await a.close()
 
         assert a.state == ChannelState.CLOSED
+        assert a.peer is None
+        assert b.peer is None
+        assert await b.read(100) == b"x"
+        with pytest.raises(ChannelError, match="No peer connected"):
+            await b.write(b"y")
+
+    @pytest.mark.asyncio
+    async def test_reopened_channel_reads_nothing_stale(self) -> None:
+        """close() then open() leaves no false EOF for the first read."""
+        a, b = create_channel_pair(config_a=SimulatorConfig(read_timeout=0.1))
+        await a.open()
+        await b.open()
+
+        await a.close()
+        await a.open()
+        with pytest.raises(ChannelTimeoutError):
+            await a.read(100)
+
+        a.connect_to(b)
+        await b.write(b"fresh")
+        assert await a.read(100) == b"fresh"
+
+    @pytest.mark.asyncio
+    async def test_reopened_channel_still_sees_peer_eof(self) -> None:
+        """After a reopen, a genuine peer close still reads as EOF."""
+        a, b = create_channel_pair()
+        await a.open()
+        await b.open()
+        await a.close()
+        await a.open()
+        a.connect_to(b)
+
+        await b.close()
+
+        assert await a.read(100) == b""
+        assert a.state == ChannelState.OPEN
 
 
 class TestChannelPairFactory:
